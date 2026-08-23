@@ -1,0 +1,105 @@
+name: Build x64 installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version used in the artifact name
+        required: true
+        default: 11.1.1.1
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set version
+        shell: pwsh
+        run: |
+          $version = '${{ inputs.version }}'
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            $version = '11.1.1.1'
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+            throw "Version must have four numeric components, got '$version'"
+          }
+          "ADM_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Restore .NET dependencies
+        shell: pwsh
+        run: dotnet restore AutoDarkModeApp/AutoDarkModeApp.csproj
+
+      - name: Publish x64 application
+        shell: pwsh
+        run: |
+          $publishRoot = Join-Path $env:GITHUB_WORKSPACE 'bin/Publish/x64'
+          $common = @(
+            '--configuration', 'Release',
+            '--runtime', 'win-x64',
+            '--self-contained', 'true',
+            '-p:Platform=x64',
+            "-p:Version=$env:ADM_VERSION",
+            "-p:PublishDir=$publishRoot/adm-app/ui/"
+          )
+          dotnet publish AutoDarkModeApp/AutoDarkModeApp.csproj @common
+
+          $core = $common | Where-Object { $_ -notlike '-p:PublishDir=*' }
+          $core += "-p:PublishDir=$publishRoot/adm-app/core/"
+          dotnet publish AutoDarkModeSvc/AutoDarkModeSvc.csproj @core
+          dotnet publish AutoDarkModeShell/AutoDarkModeShell.csproj @core
+
+      - name: Build Rust updater
+        shell: pwsh
+        run: |
+          cargo build --release --manifest-path adm-updater-rs/Cargo.toml
+          $updater = 'bin/Publish/x64/adm-updater'
+          New-Item -ItemType Directory -Force $updater | Out-Null
+          Copy-Item adm-updater-rs/target/release/adm-updater-rs.exe "$updater/AutoDarkModeUpdater.exe"
+          Copy-Item adm-updater-rs/license.html "$updater/license.html"
+
+      - name: Create portable ZIP
+        shell: pwsh
+        run: |
+          $artifactDir = 'bin/Artifacts'
+          New-Item -ItemType Directory -Force $artifactDir | Out-Null
+          Compress-Archive -Path 'bin/Publish/x64/adm-app', 'bin/Publish/x64/adm-updater' -DestinationPath "$artifactDir/AutoDarkMode_${env:ADM_VERSION}_x64.zip" -CompressionLevel Optimal
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup compiler not found at $iscc"
+          }
+          & $iscc installer/AutoDarkMode-x64.iss
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Create checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem bin/Artifacts -File | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+            "$hash  $($_.Name)" | Set-Content -NoNewline "$($_.FullName).sha256"
+          }
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoDarkMode_${{ env.ADM_VERSION }}_x64
+          path: bin/Artifacts/*
